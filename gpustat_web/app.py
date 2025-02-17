@@ -36,7 +36,7 @@ mem_total=$(free -g | awk 'NR==2 {printf "%5.1f", $2}');
 mem_used=$(free -g | awk 'NR==2 {printf "%5.1f", $3}');
 
 # Print system info without colors
-echo "CPU: \\033[32m${cpu_usage}%\\033[0m | Memory: \\033[33m${mem_used}\\033[0m / ${mem_total} GB";
+echo "CPU: ${cpu_usage}% | Memory: ${mem_used} / ${mem_total} GB";
 
 # Get GPU info with updated colors
 nvidia-smi --query-gpu=index,name,pstate,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
