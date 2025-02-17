@@ -1,10 +1,7 @@
 """
-gpustat.web
+nvidia-smi web monitor
 
-
-MIT License
-
-Copyright (c) 2018-2023 Jongwook Choi (@wookayin)
+Modified from gpustat.web to use nvidia-smi instead of gpustat
 """
 
 from typing import List, Tuple, Optional, Union
@@ -29,22 +26,51 @@ import aiohttp_jinja2 as aiojinja2
 
 __PATH__ = os.path.abspath(os.path.dirname(__file__))
 
-DEFAULT_GPUSTAT_COMMAND = "gpustat --color --gpuname-width 30 --show-power"
+# Command to get system stats and GPU info
+DEFAULT_NVIDIA_SMI_COMMAND = """
+# Get CPU usage
+cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{printf "%5.1f", 100-$1}');
+
+# Get memory info
+mem_total=$(free -g | awk 'NR==2 {printf "%5.1f", $2}');
+mem_used=$(free -g | awk 'NR==2 {printf "%5.1f", $3}');
+
+# Print system info without colors
+echo "CPU: \\033[32m${cpu_usage}%\\033[0m | Memory: \\033[33m${mem_used}\\033[0m / ${mem_total} GB";
+
+# Get GPU info with updated colors
+nvidia-smi --query-gpu=index,name,pstate,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+--format=csv,noheader,nounits | awk -F, '{ \
+temp=sprintf("%3d", $4); \
+util=sprintf("%3d", $5); \
+mem_used=sprintf("%5d", $6); \
+mem_total=sprintf("%5d", $7); \
+power=sprintf("%6.2f", $8); \
+printf "[%s] %s | %s | \\033[31m%s°C\\033[0m | \\033[32m%s%%\\033[0m | \\033[33m%s\\033[0m / %s MB | \\033[35m%s W\\033[0m\\n", \
+$1, $2, $3, temp, util, mem_used, mem_total, power \
+}'"""
 
 RE_ANSI = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
-###############################################################################
-# Background workers to collect information from nodes
-###############################################################################
-
 class Context(object):
-    '''The global context object.'''
     def __init__(self):
         self.host_status = OrderedDict()
         self.interval = 5.0
 
     def host_set_message(self, hostname: str, msg: str):
-        self.host_status[hostname] = colored(f"({hostname}) ", 'white') + msg + '\n'
+        lines = msg.splitlines()
+        if len(lines) >= 2:  # If we have both system stats and GPU info
+            separator = "=" * 80 + "\n"
+            timestamp = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
+            formatted_msg = (
+                f"{separator}"
+                f"{hostname} {timestamp}\n"
+                f"{lines[0]}\n"  # System stats line
+                f"{''.join(lines[1:])}\n"  # GPU info lines
+            )
+            self.host_status[hostname] = formatted_msg
+        else:
+            self.host_status[hostname] = colored(f"({hostname}) ", 'white') + msg + '\n'
 
 
 context = Context()
@@ -54,7 +80,7 @@ async def run_client(hostname: str, exec_cmd: str, *,
                      port=22, verify_host: bool = True,
                      poll_delay=None, timeout=30.0,
                      name_length=None, verbose=False):
-    '''An async handler to collect gpustat through a SSH channel.'''
+    '''An async handler to collect nvidia-smi through a SSH channel.'''
     L = name_length or 0
     if poll_delay is None:
         poll_delay = context.interval
@@ -65,18 +91,13 @@ async def run_client(hostname: str, exec_cmd: str, *,
         return data
 
     async def _loop_body():
-        # establish a SSH connection.
-        # https://asyncssh.readthedocs.io/en/latest/api.html#asyncssh.SSHClientConnectionOptions
         conn_kwargs = dict()
         if not verify_host:
-            conn_kwargs['known_hosts'] = None  # Disable SSH host verification
+            conn_kwargs['known_hosts'] = None
         async with asyncssh.connect(hostname, port=port, **conn_kwargs) as conn:
             cprint(f"[{hostname:<{L}}] SSH connection established!", attrs=['bold'])
 
             while True:
-                if False: #verbose: XXX DEBUG
-                    print(f"[{hostname:<{L}}] querying... ")
-
                 result = await asyncio.wait_for(conn.run(exec_cmd), timeout=timeout)
 
                 now = datetime.now().strftime('%Y/%m/%d-%H:%M:%S.%f')
@@ -87,42 +108,39 @@ async def run_client(hostname: str, exec_cmd: str, *,
                     context.host_set_message(hostname, colored(f'[exitcode {result.exit_status}] {stderr_summary}', 'red'))
                 else:
                     if verbose:
-                        cprint(f"[{now} [{hostname:<{L}}] OK from gpustat "
+                        cprint(f"[{now} [{hostname:<{L}}] OK from nvidia-smi "
                                f"({len(_str(result.stdout or ''))} bytes)", color='cyan')
-                    # update data
-                    context.host_status[hostname] = result.stdout
+                    # Format the output to be similar to gpustat
+                    formatted_output = "=" * 80 + "\n"  # Separator line
+                    formatted_output += f"{hostname}  " + datetime.now().strftime('%Y/%m/%d %H:%M:%S') + "\n"
+                    formatted_output += _str(result.stdout)
+                    formatted_output += "\n"  # Extra newline for spacing
+                    context.host_status[hostname] = formatted_output
 
-                # wait for a while...
                 await asyncio.sleep(poll_delay)
 
     while True:
         try:
-            # start SSH connection, or reconnect if it was disconnected
             await _loop_body()
-
         except asyncio.CancelledError:
             cprint(f"[{hostname:<{L}}] Closed as being cancelled.", attrs=['bold'])
             break
         except (asyncio.TimeoutError) as ex:
-            # timeout (retry)
             cprint(f"Timeout after {timeout} sec: {hostname}", color='red')
             context.host_set_message(hostname, colored(f"Timeout after {timeout} sec", 'red'))
         except (asyncssh.misc.DisconnectError, asyncssh.misc.ChannelOpenError, OSError) as ex:
-            # error or disconnected (retry)
             cprint(f"Disconnected : {hostname}, {str(ex)}", color='red')
             context.host_set_message(hostname, colored(str(ex), 'red'))
         except Exception as e:
-            # A general exception unhandled, throw
             cprint(f"[{hostname:<{L}}] {e}", color='red')
             context.host_set_message(hostname, colored(f"{type(e).__name__}: {e}", 'red'))
             cprint(traceback.format_exc())
             raise
 
-        # retry upon timeout/disconnected, etc.
         cprint(f"[{hostname:<{L}}] Disconnected, retrying in {poll_delay} sec...", color='yellow')
         await asyncio.sleep(poll_delay)
 
-
+# Rest of the code remains similar, just updating the command references
 async def spawn_clients(hosts: List[str], exec_cmd: str, *,
                         default_port: int, verify_host: bool = True,
                         verbose=False):
@@ -160,8 +178,7 @@ async def spawn_clients(hosts: List[str], exec_cmd: str, *,
         # TODO: throw the exception outside and let aiohttp abort startup
         traceback.print_exc()
         cprint(colored("Error: An exception occured during the startup.", 'red'))
-
-
+        
 ###############################################################################
 # webserver handlers.
 ###############################################################################
@@ -265,9 +282,6 @@ async def websocket_handler(request):
     print("INFO: Websocket connection from {} closed".format(request.remote))
     return ws
 
-###############################################################################
-# app factory and entrypoint.
-###############################################################################
 
 def create_app(*,
                hosts=['localhost'],
@@ -278,21 +292,20 @@ def create_app(*,
                exec_cmd: Optional[str] = None,
                verbose=True):
     if not exec_cmd:
-        exec_cmd = DEFAULT_GPUSTAT_COMMAND
+        exec_cmd = DEFAULT_NVIDIA_SMI_COMMAND
 
     app = web.Application()
     app.router.add_get('/', handler)
     app.add_routes([web.get('/ws', websocket_handler)])
-    app.add_routes([web.get('/gpustat.html', make_static_handler('html'))])
-    app.add_routes([web.get('/gpustat.ansi', make_static_handler('ansi'))])
-    app.add_routes([web.get('/gpustat.txt', make_static_handler('plain'))])
+    app.add_routes([web.get('/nvidia-smi.html', make_static_handler('html'))])
+    app.add_routes([web.get('/nvidia-smi.ansi', make_static_handler('ansi'))])
+    app.add_routes([web.get('/nvidia-smi.txt', make_static_handler('plain'))])
 
     async def start_background_tasks(app):
         clients = spawn_clients(
             hosts, exec_cmd, default_port=default_port,
             verify_host=verify_host,
             verbose=verbose)
-        # See #19 for why we need to this against aiohttp 3.5, 3.8, and 4.0
         loop = app.loop if hasattr(app, 'loop') else asyncio.get_event_loop()
         app['tasks'] = loop.create_task(clients)
         await asyncio.sleep(0.1)
@@ -315,10 +328,9 @@ def create_app(*,
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(certfile=ssl_certfile,
                                     keyfile=ssl_keyfile)
-
         cprint(f"Using Secure HTTPS (SSL/TLS) server ...", color='green')
     else:
-        ssl_context = None   # type: ignore
+        ssl_context = None
     return app, ssl_context
 
 
@@ -341,8 +353,8 @@ def main():
     parser.add_argument('--ssl-keyfile', type=str, default=None,
                         help="Path to the SSL private key file (Optional, if want to run HTTPS server)")
     parser.add_argument('--exec', type=str,
-                        default=DEFAULT_GPUSTAT_COMMAND,
-                        help="command-line to execute (e.g. gpustat --color --gpuname-width 25)")
+                        default=DEFAULT_NVIDIA_SMI_COMMAND,
+                        help="command-line to execute (default: nvidia-smi with formatted output)")
     args = parser.parse_args()
 
     hosts = args.hosts or ['localhost']
